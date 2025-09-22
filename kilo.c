@@ -3,120 +3,139 @@
 #include <asm-generic/ioctls.h>
 #include <stdio.h>
 #include <unistd.h>
-#include<ctype.h>
-#include <errno.h>
-#include <termios.h>
-#include<stdlib.h>
-#include<sys/ioctl.h>
+#include <ctype.h>      // for iscntrl()
+#include <errno.h>      // for errno
+#include <termios.h>    // terminal settings
+#include <stdlib.h>
+#include <sys/ioctl.h>  // get window size
 
 /*** defines ***/
-
-#define CTRL_KEY(k) ((k) & 0x1f)
+#define CTRL_KEY(k) ((k) & 0x1f) // turn a character into its Ctrl equivalent
 
 /*** data ***/
 struct editorConfig {
-    struct termios old;
+    struct termios old;  // store original terminal settings to restore on exit
     int screenrows;
     int screencols;
-
 };
 struct editorConfig E;
 
 /*** terminal ***/
 
+// print an error and exit
 void die(const char *s){
-    write(STDOUT_FILENO,"\x1b[2J",4);
-    write(STDOUT_FILENO,"\x1b[H",3);
-
-    perror(s);
+    write(STDOUT_FILENO,"\x1b[2J",4); // clear screen
+    write(STDOUT_FILENO,"\x1b[H",3);  // move cursor to top-left
+    perror(s);  // print reason for failure
     exit(1);
 }
+
+// restore terminal settings
 void disableRawMode(){
     if (tcsetattr(STDIN_FILENO, TCSAFLUSH, &E.old) == -1)
-        die("tcesetattr");
+        die("tcsetattr");
 }
 
+// put terminal in raw mode
 void enableRawMode(){
-    atexit(disableRawMode);
-    if (tcgetattr(STDIN_FILENO, &E.old)== -1)
+    atexit(disableRawMode); // make sure we restore terminal when program exits
+
+    if (tcgetattr(STDIN_FILENO, &E.old) == -1) // get current settings
         die("tcgetattr");
+
     struct termios raw = E.old;
-    raw.c_lflag &= ~(ECHO | ICANON | IEXTEN |ISIG  );
+
+    // disable stuff that can interfere with raw input
+    raw.c_lflag &= ~(ECHO | ICANON | IEXTEN | ISIG); 
+    // ECHO: stop automatic echoing of typed characters
+    // ICANON: turn off canonical mode so input is immediate
+    // IEXTEN: disable Ctrl-V etc
+    // ISIG: turn off Ctrl-C and Ctrl-Z signals
+
     raw.c_iflag &= ~(IXON | ICRNL | INPCK | ISTRIP | BRKINT);
-    raw.c_oflag &= ~(OPOST);
-    raw.c_cflag |= (CS8);
+    // IXON: disable Ctrl-S / Ctrl-Q
+    // ICRNL: don’t convert CR to NL
+    // INPCK, ISTRIP, BRKINT: disable input processing
+
+    raw.c_oflag &= ~(OPOST); // disable output processing
+
+    raw.c_cflag |= (CS8); // 8-bit characters
+
+    raw.c_cc[VMIN] = 0;   // read returns as soon as input is available
+    raw.c_cc[VTIME] = 1;  // or after 0.1s timeout
+
     if (tcsetattr(STDIN_FILENO, TCSAFLUSH, &raw) == -1)
         die("tcsetattr");
-    raw.c_cc[VMIN] = 0;
-    raw.c_cc[VTIME] = 1;
 }
 
+// read one keypress from user
 char editorReadKey(){
     int nread;
     char c;
-    while((nread = read(STDIN_FILENO,&c,1)) != 1){
-        if(nread == -1 && errno != EAGAIN) die("read");
+    while ((nread = read(STDIN_FILENO, &c, 1)) != 1) {
+        if (nread == -1 && errno != EAGAIN) die("read");
+        // keep trying if read is interrupted
     }
     return c;
 }
 
+// figure out the terminal window size
 int getWindowSize(int* rows, int* cols){
     struct winsize ws;
-    if ((ioctl(STDOUT_FILENO, TIOCGWINSZ, &ws) == -1) || ws.ws_col == 0 || ws.ws_row == 0) return -1;
-    else {
-        *rows = ws.ws_row;
-        *cols = ws.ws_col;
-        return 0;
-    }
+    if ((ioctl(STDOUT_FILENO, TIOCGWINSZ, &ws) == -1) || ws.ws_col == 0 || ws.ws_row == 0)
+        return -1;
+    *rows = ws.ws_row;
+    *cols = ws.ws_col;
+    return 0;
 }
 
 /*** input ***/
 
+// handle keypresses
 void editorProcessKeypress(){
     char c = editorReadKey();
 
     switch (c) {
-        case CTRL_KEY('q'):
-            write(STDOUT_FILENO,"\x1b[2J",4);
-            write(STDOUT_FILENO,"\x1b[H",3);
+        case CTRL_KEY('q'): // quit on Ctrl-Q
+            write(STDOUT_FILENO,"\x1b[2J",4); // clear screen
+            write(STDOUT_FILENO,"\x1b[H",3);  // move cursor top-left
             exit(0);
-            break;
     }
 }
 
 /*** output ***/
 
+// draw every row of the editor
 void editorDrawRows(){
-    for(int y = 0 ; y<E.screenrows ; y++){
-        write(STDOUT_FILENO,"~\r\n",3);
+    for (int y = 0; y < E.screenrows; y++){
+        write(STDOUT_FILENO,"~\r\n",3); // show ~ on empty lines
     }
 }
 
+// refresh the screen
 void editorRefreshScreen(){
-    write(STDOUT_FILENO,"\x1b[2J",4);  // \x1b[2J is an espace sequence , any esc sequence starts with \x1b , which is the esc charector followed by a [ charector
-                                       // we are using J command which clears the screen with arguement 2 that clears entire screen.
-                                       // 4 in write(args) means we are writing 4 bytes to STDOUT_FILENO
-    write(STDOUT_FILENO,"\x1b[H",3); // move cursor to top of screen at each refresh
-    
-    editorDrawRows();
-    write(STDOUT_FILENO,"\x1b[H",3);
+    write(STDOUT_FILENO,"\x1b[2J",4); // clear everything
+    write(STDOUT_FILENO,"\x1b[H",3);  // move cursor to top-left
+
+    editorDrawRows();                  // draw the rows
+    write(STDOUT_FILENO,"\x1b[H",3);  // move cursor back to top-left
 }
-
-
 
 /*** init ***/
 
-int initEditor(){
-    if (getWindowSize(&E.screenrows,&E.screencols) == -1) die("getWindowSize");
+void initEditor(){
+    if (getWindowSize(&E.screenrows, &E.screencols) == -1) die("getWindowSize");
 }
 
-int main(){
-    enableRawMode();
-    initEditor();
+/*** main ***/
 
-    while(1){
-        editorRefreshScreen();
-        editorProcessKeypress();
+int main(){
+    enableRawMode(); // raw mode on
+    initEditor();    // figure out screen size
+
+    while (1) {
+        editorRefreshScreen(); // redraw screen
+        editorProcessKeypress(); // handle keys
     }
 
     return 0;
